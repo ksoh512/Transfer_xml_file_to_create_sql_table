@@ -1,0 +1,331 @@
+USE [DataPlatformStage]
+GO
+/****** Object:  StoredProcedure [dbo].[sp_hpe_ae_xml_load]    Script Date: 08/31/17 01:14:42 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+-- =============================================
+-- Author:		Elliott Anderson
+-- Create date: 8/7/2017
+-- Description:	Loads HPE Asset Entitlement data from XML file into staging table.
+-- =============================================
+ALTER PROCEDURE [dbo].[sp_hpe_ae_xml_load]
+AS
+BEGIN
+	-- SET NOCOUNT ON added to prevent extra result sets from
+	-- interfering with SELECT statements.
+	SET NOCOUNT ON;
+
+	DECLARE @runScripts INT
+	-- Set this to 1 if we're grabbing files from FTP server, set to 0 if just testing result set from existing files.
+	SET @runScripts = 1
+
+	IF OBJECT_ID('tempdb..#temp') IS NOT NULL
+	BEGIN
+		DROP TABLE #temp
+	END
+
+	CREATE TABLE #temp (
+		[id] [int] IDENTITY(1,1) NOT NULL,
+		[idoc_number] [nvarchar](255) NULL,
+		[hpe_serial_number] [nvarchar](255) NULL,
+		[hpe_product_sku] [nvarchar](255) NULL,
+		[is_nimble_hardware] [nvarchar](255) NULL,
+		[product] [nvarchar](255) NULL,
+		[product_type] [nvarchar](255) NULL,
+		[order_status] [nvarchar](255) NULL,
+		[order_type] [nvarchar](255) NULL,
+		[hpe_order_number] [nvarchar](255) NULL,
+		[hpe_line_number] [nvarchar](255) NULL,
+		[hpe_quote_number] [nvarchar](255) NULL,
+		[hpe_opportunity_id] [nvarchar](255) NULL,
+		[end_customer_account_name] [nvarchar](255) NULL,
+		[end_customer_account_ref_id] [nvarchar](255) NULL,
+		[end_customer_ship_to_contact_name] [nvarchar](255) NULL,
+		[end_customer_ship_to_contact_email] [nvarchar](255) NULL,
+		[purchase_date] [nvarchar](255) NULL,
+		[order_ship_date] [nvarchar](255) NULL,
+		[support_start_date] [nvarchar](255) NULL,
+		[support_end_date] [nvarchar](255) NULL,
+		[support_term] [nvarchar](255) NULL,
+		[install_address_street_1] [nvarchar](255) NULL,
+		[install_address_street_2] [nvarchar](255) NULL,
+		[install_address_city] [nvarchar](255) NULL,
+		[install_address_state] [nvarchar](255) NULL,
+		[install_address_country] [nvarchar](255) NULL,
+		[nimble_sfdc_asset_id] [nvarchar](255) NULL,
+		[created_on] [datetime] NULL,
+		[filename] [nvarchar](255) NULL,
+		[asset_created_in_sfdc] [bit] NULL,
+		[asset_created_in_sfdc_on] [datetime] NULL,
+		[include_record] [bit] NULL
+	)
+
+	IF @runScripts = 1
+	BEGIN
+		-- Execute batch file to pull all .xml files from FTP site to this server
+		EXECUTE xp_cmdshell 'C:\scripts\hpe_asset_entitlement\run_get_asset_entitlement_files.bat'
+	END
+
+	-- Create list of .xml files to loop through
+	DECLARE @files TABLE (id int IDENTITY, filename varchar(255))
+	INSERT INTO @files
+	EXECUTE xp_cmdshell 'dir C:\extracts\hpe_asset_entitlement\*.xml /b'
+
+	DECLARE @filepath VARCHAR(255)
+	DECLARE @file VARCHAR(255)
+
+	-- While there are still files to process, loop-de-loop
+	WHILE (SELECT COUNT(1) FROM @files WHERE [filename] IS NOT NULL) > 0
+	BEGIN
+		-- Get file name and attach to file path location
+		SET @file = (SELECT TOP 1 [filename] FROM @files)
+		SET @filepath = 'C:\extracts\hpe_asset_entitlement\' + @file
+
+		-- As long as there's an .xml file to process, do it already
+		IF (@filepath IS NOT NULL AND SUBSTRING(@file, LEN(@file) - 3, 4) = '.xml')
+		BEGIN
+			DECLARE @xml XML
+			DECLARE @dynamicSQL NVARCHAR(MAX)
+			-- Need dynamic SQL here in order to leverage the dynamic filepath variable for OPENROWSET()
+			SET @dynamicSQL = N'SELECT @dynxml = BulkColumn
+			FROM OPENROWSET(BULK ''' + @filepath + ''', SINGLE_BLOB) x'
+			-- Load the results into @xml
+			EXEC sp_executesql @dynamicSQL, N'@dynxml XML out', @xml out
+
+			-- Insert data from current .xml file into hpe_shipped_sales_orders
+			--INSERT INTO DataPlatformStage.dbo.hpe_shipped_sales_orders
+			INSERT INTO #temp
+			SELECT y.*
+			FROM
+			(SELECT
+				x.idoc_number
+				, LTRIM(RTRIM(x.hpe_serial_number)) AS [hpe_serial_number]
+				, x.hpe_product_sku AS [hpe_product_sku]
+				, x.is_nimble_hardware AS [is_nimble_hardware]
+				, x.product AS [product]
+				, x.product_type AS [product_type]
+				, 'Shipped' AS [order_status]
+				, x.order_type AS [order_type]
+				, x.hpe_order_number AS [hpe_order_number]
+				, x.hpe_line_number AS [hpe_line_number]
+				, x.hpe_quote_number AS [hpe_quote_number]
+				, x.hpe_opportunity_id AS [hpe_opportunity_id]
+				, x.end_customer_account_name AS [end_customer_account_name]
+				, x.end_customer_account_ref_id AS [end_customer_account_ref_id]
+				, x.end_customer_ship_to_contact_name AS [end_customer_ship_to_contact_name]
+				, x.end_customer_ship_to_contact_email AS [end_customer_ship_to_contact_email]
+				, x.purchase_date AS [purchase_date]
+				, x.order_ship_date AS [order_ship_date]
+				, NULL AS [support_start_date]
+				, NULL AS [support_end_date]
+				, NULL AS [support_term]
+				, x.install_address_street_1 AS [install_address_street_1]
+				, x.install_address_street_2 AS [install_address_street_2]
+				, x.install_address_city AS [install_address_city]
+				, x.install_address_state AS [install_address_state]
+				, x.install_address_country AS [install_address_country]
+				, NULL AS [nimble_sfdc_asset_id]
+				, GETDATE() AS [created_on]
+				, @filepath AS [filename]
+				, 0 AS [asset_created_in_sfdc]
+				, NULL AS [asset_created_in_sfdc_on]
+				-- Basically any field calculated with a CASE statement should be included here. NULL values will get filtered out. If any one of these fields is populated, include the row.
+				, CASE WHEN (--x.[hpe_opportunity_id] IS NOT NULL
+					--OR
+					x.[install_address_street_1] IS NOT NULL
+					OR x.[install_address_street_2] IS NOT NULL
+					OR x.[install_address_city] IS NOT NULL
+					OR x.[install_address_state] IS NOT NULL
+					OR x.[install_address_country] IS NOT NULL
+					OR x.[end_customer_account_name] IS NOT NULL
+					OR x.[end_customer_account_ref_id] IS NOT NULL
+					OR x.[end_customer_ship_to_contact_name] IS NOT NULL
+					OR x.[end_customer_ship_to_contact_email] IS NOT NULL) THEN 1 ELSE 0 END AS [include_record]
+			FROM (
+			SELECT DISTINCT
+				idoc_t.idoc_c.value('(EDI_DC40/DOCNUM/text())[1]', 'VARCHAR(255)') AS [idoc_number],
+				CASE
+					WHEN idoc_t.idoc_c.value('(ZUP_TXT_HDR/TDID/text())[1]', 'VARCHAR(255)') = 'ZSFO' THEN idoc_t.idoc_c.value('(ZUP_TXT_HDR/ZUP_TXT_2/TDLINE/text())[1]', 'VARCHAR(255)')
+					ELSE NULL
+				END AS [hpe_opportunity_id],
+				zsi_t.zsi_c.value('(ITEM_ENTRY/text())[1]', 'VARCHAR(255)') AS [hpe_line_number],
+				CASE
+					WHEN zsi_t.zsi_c.value('(PL_ITEM/text())[1]', 'VARCHAR(255)') IN ('V1','V2') THEN 1
+					ELSE 0
+				END AS [is_nimble_hardware],
+				zsi_t.zsi_c.value('(PL_ITEM/text())[1]', 'VARCHAR(255)') AS [product],
+				CASE
+					WHEN zsi_t.zsi_c.value('(ID_CD_ITEM/text())[1]', 'VARCHAR(255)') = '55' THEN 'service'
+					WHEN zsi_t.zsi_c.value('(ID_CD_ITEM/text())[1]', 'VARCHAR(255)') = '57' THEN 'one-time service'
+					WHEN zsi_t.zsi_c.value('(ID_CD_ITEM/text())[1]', 'VARCHAR(255)') = 'ED' THEN 'software'
+					ELSE 'hardware'
+				END AS [product_type],
+				zsi_t.zsi_c.value('(PROD_NO/text())[1]', 'VARCHAR(255)') AS [hpe_product_sku],
+				zsh_t.zsh_c.value('(HP_RECEIVE_DATE/text())[1]', 'VARCHAR(255)') AS [purchase_date],
+				zsh_t.zsh_c.value('(ORDER_TYPE/text())[1]', 'VARCHAR(255)') AS [order_type],
+				zsh_t.zsh_c.value('(QUOTE_NO/text())[1]', 'VARCHAR(255)') AS [hpe_quote_number],
+				zsh_t.zsh_c.value('(SHIP_FLAG/text())[1]', 'VARCHAR(255)') AS [order_status],
+				zsh_t.zsh_c.value('(ORD_SEC/text())[1]', 'VARCHAR(255)') AS [hpe_order_number],
+				zsi_t.zsi_c.value('(ZUP_DELIVERY/ZUP_DELIVERY_ITEM/ZUP_SERIAL/SERIALNO/text())[1]', 'VARCHAR(255)') AS [hpe_serial_number],
+				zsi_t.zsi_c.value('(ZUP_DELIVERY/DELIV_DATE/text())[1]', 'VARCHAR(255)') AS [order_ship_date],
+				CASE
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'WE' THEN zp_t.zp_c.value('(LAND1/text())[1]', 'VARCHAR(255)')
+					ELSE NULL
+				END AS [install_address_country],
+				CASE
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'WE' THEN zp_t.zp_c.value('(ORT01/text())[1]', 'VARCHAR(255)')
+					ELSE NULL
+				END AS [install_address_city],
+				CASE
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'WE' THEN zp_t.zp_c.value('(ORT02/text())[1]', 'VARCHAR(255)')
+					ELSE NULL
+				END AS [install_address_state],
+				CASE
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'WE' THEN zp_t.zp_c.value('(STRAS/text())[1]', 'VARCHAR(255)')
+					ELSE NULL
+				END AS [install_address_street_1],
+				CASE
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'WE' THEN zp_t.zp_c.value('(STRS2/text())[1]', 'VARCHAR(255)')
+					ELSE NULL
+				END AS [install_address_street_2],
+				CASE
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'EN' THEN zp_t.zp_c.value('(CONTACT_NAME/text())[1]', 'VARCHAR(255)')
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'EU' THEN zp_t.zp_c.value('(CONTACT_NAME/text())[1]', 'VARCHAR(255)')
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'Z2' THEN zp_t.zp_c.value('(CONTACT_NAME/text())[1]', 'VARCHAR(255)')
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'UC' THEN zp_t.zp_c.value('(CONTACT_NAME/text())[1]', 'VARCHAR(255)')
+					ELSE NULL
+				END AS [end_customer_ship_to_contact_name],
+				CASE
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'EN' THEN zp_t.zp_c.value('(NAME1/text())[1]', 'VARCHAR(255)')
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'EU' THEN zp_t.zp_c.value('(NAME1/text())[1]', 'VARCHAR(255)')
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'Z2' THEN zp_t.zp_c.value('(NAME1/text())[1]', 'VARCHAR(255)')
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'UC' THEN zp_t.zp_c.value('(NAME1/text())[1]', 'VARCHAR(255)')
+					ELSE NULL
+				END AS [end_customer_account_name],
+				CASE
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'EN' THEN zp_t.zp_c.value('(PARTN/text())[1]', 'VARCHAR(255)')
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'EU' THEN zp_t.zp_c.value('(PARTN/text())[1]', 'VARCHAR(255)')
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'Z2' THEN zp_t.zp_c.value('(PARTN/text())[1]', 'VARCHAR(255)')
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'UC' THEN zp_t.zp_c.value('(PARTN/text())[1]', 'VARCHAR(255)')
+					ELSE NULL
+				END AS [end_customer_account_ref_id],
+				CASE
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'EN' THEN zp_t.zp_c.value('(SMTP_ADDR/text())[1]', 'VARCHAR(255)')
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'EU' THEN zp_t.zp_c.value('(SMTP_ADDR/text())[1]', 'VARCHAR(255)')
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'Z2' THEN zp_t.zp_c.value('(SMTP_ADDR/text())[1]', 'VARCHAR(255)')
+					WHEN zp_t.zp_c.value('(PARVW/text())[1]', 'VARCHAR(255)') = 'UC' THEN zp_t.zp_c.value('(SMTP_ADDR/text())[1]', 'VARCHAR(255)')
+					ELSE NULL
+				END AS [end_customer_ship_to_contact_email]
+				-- @xml.nodes() is the document root we're working with
+			FROM @xml.nodes('ZUPIORDR2/IDOC') idoc_t(idoc_c)
+			-- CROSS APPLY's are basically a "for each" on the specified child node so that we make sure we don't miss a section
+			CROSS APPLY idoc_t.idoc_c.nodes('ZUP_SO_HDR') AS zsh_t(zsh_c)
+			CROSS APPLY zsh_t.zsh_c.nodes('ZUP_SO_ITEM') AS zsi_t(zsi_c) -- this section is a child of ZUP_SO_HDR
+			CROSS APPLY idoc_t.idoc_c.nodes('ZUP_PARTNER') AS zp_t(zp_c)
+			) x
+			) y
+			WHERE y.include_record = 1 -- ignore extra rows with all NULLs
+			AND (y.is_nimble_hardware = 1 -- we only care about Nimble products
+			OR y.product_type <> 'hardware') -- or any service items
+		END -- end if
+
+		-- We're done importing data from this file, so like Jay-Z says, on to the next one
+		DELETE FROM @files WHERE [filename] = @file
+
+	END	-- end while
+	-- Once all the files have been processed and loaded to DB, archive all .xml files on SJC-DW-SQL
+	EXECUTE xp_cmdshell 'move C:\extracts\hpe_asset_entitlement\*.xml C:\extracts\hpe_asset_entitlement\archive\'
+
+	IF @runScripts = 1
+	BEGIN
+		TRUNCATE TABLE DataPlatformStage.dbo.hpe_shipped_sales_orders
+		INSERT INTO DataPlatformStage.dbo.hpe_shipped_sales_orders
+		SELECT DISTINCT
+			q.idoc_number
+			, MAX(q.hpe_serial_number) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.hpe_product_sku) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.product) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.order_status) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.order_type) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.hpe_order_number) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, q.hpe_line_number
+			, MAX(q.hpe_quote_number) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.hpe_opportunity_id) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.end_customer_account_name) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.end_customer_account_ref_id) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.end_customer_ship_to_contact_name) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.end_customer_ship_to_contact_email) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.purchase_date) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.order_ship_date) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.sla) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.support_start_date) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.support_end_date) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.support_term) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.install_address_street_1) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.install_address_street_2) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.install_address_city) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.install_address_state) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.install_address_state) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.nimble_sfdc_asset_id) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, q.created_on
+			, q.filename
+			, q.asset_created_in_sfdc
+			, q.asset_created_in_sfdc_on
+		FROM
+		(SELECT
+			s.hpe_product_sku AS [sla]
+			, RANK() OVER (PARTITION BY h.hpe_order_number, h.filename, h.hpe_line_number ORDER BY h.hpe_line_number, s.hpe_line_number) AS [rank]
+			, h.*
+		FROM #temp h
+		LEFT JOIN #temp s ON h.hpe_order_number = s.hpe_order_number AND h.filename = s.filename AND s.product_type = 'service' AND h.hpe_line_number < s.hpe_line_number
+		WHERE h.product_type = 'hardware') q
+		WHERE q.[rank] = 1
+		ORDER BY q.filename, q.hpe_line_number
+	END
+	ELSE
+	BEGIN
+		SELECT DISTINCT
+			q.idoc_number
+			, MAX(q.hpe_serial_number) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.hpe_product_sku) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.product) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.order_status) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.order_type) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.hpe_order_number) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, q.hpe_line_number
+			, MAX(q.hpe_quote_number) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.hpe_opportunity_id) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.end_customer_account_name) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.end_customer_account_ref_id) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.end_customer_ship_to_contact_name) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.end_customer_ship_to_contact_email) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.purchase_date) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.order_ship_date) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.sla) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.support_start_date) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.support_end_date) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.support_term) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.install_address_street_1) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.install_address_street_2) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.install_address_city) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.install_address_state) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.install_address_state) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, MAX(q.nimble_sfdc_asset_id) OVER (PARTITION BY q.filename, q.hpe_line_number)
+			, q.created_on
+			, q.filename
+			, q.asset_created_in_sfdc
+			, q.asset_created_in_sfdc_on
+		FROM
+		(SELECT
+			s.hpe_product_sku AS [sla]
+			, RANK() OVER (PARTITION BY h.hpe_order_number, h.filename, h.hpe_line_number ORDER BY h.hpe_line_number, s.hpe_line_number) AS [rank]
+			, h.*
+		FROM #temp h
+		LEFT JOIN #temp s ON h.hpe_order_number = s.hpe_order_number AND h.filename = s.filename AND s.product_type = 'service' AND h.hpe_line_number < s.hpe_line_number
+		WHERE h.product_type = 'hardware') q
+		WHERE q.[rank] = 1
+		ORDER BY q.filename, q.hpe_line_number
+	END
+END -- end sp
